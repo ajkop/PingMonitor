@@ -1,0 +1,12 @@
+certifi==2019.3.9
+chardet==3.0.4
+docutils==0.14
+idna==2.8
+influxdb==5.2.2
+pid==2.2.3
+python-daemon==2.2.3
+python-dateutil==2.8.0
+pythonping==1.0.3
+pytz==2019.1
+six==1.12.0
+urllib3==1.25.3
