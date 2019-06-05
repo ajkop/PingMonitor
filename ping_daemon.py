@@ -15,17 +15,17 @@ from exceptions import ConfigError
 
 
 class PingDaemon:
-    def __init__(self):
+    def __init__(self, config_file='daemon.ini'):
         # Read ini file into config
         self.config = configparser.ConfigParser()
-        self.config.read('daemon.ini')
+        self.config.read(config_file)
 
-        # Check for required config sections
-        if 'DAEMON' not in self.config.sections():
-            raise ConfigError(f'No "DAEMON section provided in config.')
+        # Iterate over required configs and raise exception if not found in provided config file.
+        required_configs = ['DAEMON', 'DB', 'LOGGING']
 
-        if "DB" not in self.config.sections():
-            raise ConfigError(f'No "DB section provided in config.')
+        for conf in required_configs:
+            if conf not in self.config.sections():
+                raise ConfigError(f'{conf} config missing.')
 
         self.daemon_config = self.config['DAEMON']
         self.db_config = self.config['DB']
@@ -51,9 +51,8 @@ class PingDaemon:
         self.pid_file = self.daemon_config.get('pid_file')
         self.targets = [target.strip() for target in self.daemon_config.get('targets').split(',')]
 
-        sig_map ={
-                signal.SIGTERM: self.shutdown,
-                signal.SIGTSTP: self.shutdown}
+        sig_map = {signal.SIGTERM: self.shutdown, signal.SIGTSTP: self.shutdown}
+
         # Create Daemon context
         self.daemon_ctx = DaemonContext(uid=uid, gid=gid, files_preserve=[log_handler.stream, ],
                                         pidfile=PidFile(self.pid_file), stderr=log_handler.stream,
@@ -96,15 +95,21 @@ class PingDaemon:
         db_client = self.db_client()
         while True:
             for host in self.targets:
-                r = pping(host)
-                min_insert = {"measurement": "min_rtt", "tags": {"host": f"{host}"},
-                              "fields": {"min_rtt_ms": float(r.rtt_min_ms)}}
-                avg_insert = {"measurement": "avg_rtt", "tags": {"host": f"{host}"},
-                              "fields": {"avg_rtt_ms": float(r.rtt_avg_ms)}}
-                max_insert = {"measurement": "max_rtt", "tags": {"host": f"{host}"},
-                              "fields": {"max_rtt_ms": float(r.rtt_max_ms)}}
-                db_client.write_points([min_insert, avg_insert, max_insert])
-                time.sleep(interval)
+                # Attempt to ping the host target, has its own try catch to ensure the daemon
+                # continues even during outages.
+                try:
+                    r = pping(host)
+
+                    min_insert = {"measurement": "min_rtt", "tags": {"host": f"{host}"},
+                                  "fields": {"min_rtt_ms": float(r.rtt_min_ms)}}
+                    avg_insert = {"measurement": "avg_rtt", "tags": {"host": f"{host}"},
+                                  "fields": {"avg_rtt_ms": float(r.rtt_avg_ms)}}
+                    max_insert = {"measurement": "max_rtt", "tags": {"host": f"{host}"},
+                                  "fields": {"max_rtt_ms": float(r.rtt_max_ms)}}
+                    db_client.write_points([min_insert, avg_insert, max_insert])
+                    time.sleep(interval)
+                except OSError as e:
+                    self.logger.exception(f'Caught OS error during ping: {e}')
 
     def check_pid(self):
         try:
