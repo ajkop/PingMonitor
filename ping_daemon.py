@@ -1,62 +1,31 @@
-import signal
-import sys
 import time
 import os
-import logging
 import argparse
-import configparser
-from pid import PidFile
 
 from pythonping import ping as pping
-from daemon import DaemonContext
 from influxdb import InfluxDBClient
 
-from exceptions import ConfigError
+from base_daemon import BaseDaemon
 
 
-class PingDaemon:
+class PingDaemon(BaseDaemon):
+
     def __init__(self, config_file='daemon.ini'):
-        # Read ini file into config
-        self.config = configparser.ConfigParser()
-        self.config.read(config_file)
 
-        # Iterate over required configs and raise exception if not found in provided config file.
-        required_configs = ['DAEMON', 'DB', 'LOGGING']
+        # Set this Daemon Class's config section before Inherited class instantiation
+        self.config_section = "PING-DAEMON"
 
-        for conf in required_configs:
-            if conf not in self.config.sections():
-                raise ConfigError(f'{conf} config missing.')
+        # Instantiate the inherited BaseDaemon class
+        BaseDaemon.__init__(self, config_file=config_file)
 
-        self.daemon_config = self.config['DAEMON']
-        self.db_config = self.config['DB']
-        log_config = self.config['LOGGING']
+        self.my_config = self.config[self.config_section]
 
-        # Create logger
-        self.logger = logging.getLogger(__name__)
+        # Get the Ping Daemons DB config
+        self.db_config = self.config['PING-DB']
 
-        self.log_file = log_config.get('logfile')
-        if '~' in self.log_file:
-            self.log_file = os.path.expanduser(self.log_file)
+        self.targets = [target.strip() for target in self.my_config.get('targets').split(',')]
 
-        # Configure logger
-        log_handler = logging.FileHandler(self.log_file)
-        log_formatter = logging.Formatter(log_config.get('format', raw=True))
-        log_handler.setFormatter(log_formatter)
-        self.logger.addHandler(log_handler)
-        self.logger.setLevel(logging.DEBUG)
-
-        # Gather Daemon ctx config options
-        uid = self.daemon_config.getint('uid')
-        gid = self.daemon_config.getint('gid')
-        self.pid_file = self.daemon_config.get('pid_file')
-        self.targets = [target.strip() for target in self.daemon_config.get('targets').split(',')]
-
-        sig_map = {signal.SIGTERM: self.shutdown, signal.SIGTSTP: self.shutdown}
-
-        # Create Daemon context
-        self.daemon_ctx = DaemonContext(uid=uid, gid=gid, files_preserve=[log_handler.stream, ],
-                                        pidfile=PidFile(self.pid_file), stderr=log_handler.stream,
-                                        stdout=log_handler.stream, signal_map=sig_map)
+        self.daemon_ctx = self.get_context()
 
         self.args = self.parser()
 
@@ -86,42 +55,36 @@ class PingDaemon:
                                 database=db_name, timeout=timeout)
         return client
 
-    def shutdown(self, signum, frame):  # signum and frame are mandatory
-        self.logger.info(f'System shut down Daemon with signum: {signum}')
-        sys.exit(0)
+    def get_ping(self, host):
+
+        try:
+            ping_object = pping(host)
+            min_ms = float(ping_object.rtt_min_ms)
+            max_ms = float(ping_object.rtt_max_ms)
+            avg_ms = float(ping_object.rtt_avg_ms)
+        except OSError as e:
+            self.logger.exception(f'Caught OS error during ping, Logging 0 ping time. Error was:  {e}')
+            min_ms = 0.0
+            max_ms = 0.0
+            avg_ms = 0.0
+
+        # Takes the python-ping object and forms the influxdb insert data then returns all three write points in a list.
+        min_insert = {"measurement": "min_rtt", "tags": {"host": host},
+                      "fields": {"min_rtt_ms": min_ms}}
+        avg_insert = {"measurement": "avg_rtt", "tags": {"host": host},
+                      "fields": {"avg_rtt_ms": max_ms}}
+        max_insert = {"measurement": "max_rtt", "tags": {"host": host},
+                      "fields": {"max_rtt_ms": avg_ms}}
+        return [min_insert, avg_insert, max_insert]
 
     def main(self):
         interval = self.db_config.getint('write_interval')
         db_client = self.db_client()
         while True:
             for host in self.targets:
-                # Attempt to ping the host target, has its own try catch to ensure the daemon
-                # continues even during outages.
-                try:
-                    r = pping(host)
-
-                    min_insert = {"measurement": "min_rtt", "tags": {"host": f"{host}"},
-                                  "fields": {"min_rtt_ms": float(r.rtt_min_ms)}}
-                    avg_insert = {"measurement": "avg_rtt", "tags": {"host": f"{host}"},
-                                  "fields": {"avg_rtt_ms": float(r.rtt_avg_ms)}}
-                    max_insert = {"measurement": "max_rtt", "tags": {"host": f"{host}"},
-                                  "fields": {"max_rtt_ms": float(r.rtt_max_ms)}}
-                    db_client.write_points([min_insert, avg_insert, max_insert])
-                    time.sleep(interval)
-                except OSError as e:
-                    self.logger.exception(f'Caught OS error during ping: {e}')
-
-    def check_pid(self):
-        try:
-            os.stat(self.pid_file)
-            return True
-        except IOError:
-            return False
-
-    def get_pid(self):
-        with open(self.pid_file, 'r') as pid_file:
-            pid = pid_file.read()
-        return pid
+                ping_insert = self.get_ping(host)
+                db_client.write_points(ping_insert)
+                time.sleep(interval)
 
     def start(self):
         if self.check_pid():
